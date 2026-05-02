@@ -18,19 +18,21 @@ from ultralytics import YOLO
 # Configuration
 # =========================================================================================
 
-MODEL_PATH    = 'veggie-vision-1.pt'   # Path to the trained YOLO segmentation model
+MODEL_PATH    = 'food-1-model-3.pt'   # Path to the trained YOLO segmentation model
 CAMERA_INDEX  = 0                  # USB camera index (0 is usually the default webcam)
 CAMERA_W      = 1280               # Requested camera width
 CAMERA_H      = 720                # Requested camera height
 PANEL_W       = 300                # Width of the info panel on the right side of the window
 CONF_THRESH   = 0.4                # Minimum detection confidence to consider
+TEST_VIDEO_NAME = 'VeggieVision-Test.avi' # Test video (if not running on USB camera)
+
 
 # -----------------------------------------------------------------------------------------
 # CALIBRATION: measure a known object (e.g., a ruler) under the camera once and update this.
 # For example, if a 100 mm ruler spans 200 pixels in the camera feed, PIXELS_PER_MM = 2.0 .
 # The camera must stay at the same height for this constant to remain valid.
 # -----------------------------------------------------------------------------------------
-PIXELS_PER_MM = 373/305 # A 30.5cm ruler spans 373 pixels
+PIXELS_PER_MM = 373/305
 
 
 # Classes we assume are roughly spherical — volume = (4/3)*pi*(d/2)^3
@@ -51,6 +53,18 @@ DENSITIES = {
     'cabbage':      0.45,
 }
 
+# Finagling Factors for spherical classes — multiplied into the volume estimate to
+# correct for the fact that real vegetables aren't perfect spheres (e.g., onions are
+# typically more oblate / squat than a true sphere). Look up reasonable values for
+# your produce and update as needed; 1.0 means "treat as a perfect sphere".
+FINAGLING_FACTORS = {
+    'tomato':       1.0,
+    'yellow_onion': 1.0,
+    'red_onion':    1.0,
+    'cabbage':      1.0,
+    'apple':        1.0,
+}
+
 # Metric <-> imperial conversions
 ML_PER_CUP = 236.588
 G_PER_LB   = 453.592
@@ -65,25 +79,27 @@ MASK_ALPHA = 0.4  # Transparency for the mask fill overlay
 # Volume estimation
 # =========================================================================================
 
-def spherical_volume_ml(polygon, pixels_per_mm):
-    """Estimate the volume of a roughly-spherical object from its segmentation polygon.
+def find_spherical_length_and_volume(polygon, pixels_per_mm):
+    """Estimate the volume and diameter of a roughly-spherical object from its segmentation polygon.
     Compute the "area-equivalent radius": the radius of the circle that has the same area as the mask.
+
+    Returns (length_mm, volume_ml) where length_mm is the area-equivalent diameter.
     """
     if len(polygon) < 3:
-        return 0.0
+        return 0.0, 0.0
 
     area_px = cv2.contourArea(polygon.astype(np.float32))
     if area_px <= 0:
-        return 0.0
+        return 0.0, 0.0
 
     area_mm2 = area_px / (pixels_per_mm ** 2)
     r_mm = math.sqrt(area_mm2 / math.pi)           # A = pi*r^2  --->  r = sqrt(A/pi)
     vol_mm3 = (4.0 / 3.0) * math.pi * r_mm ** 3    # V=(4/3)*pi*r^3
-    return vol_mm3 / 1000.0  # mm^3 -> mL
+    return 2.0 * r_mm, vol_mm3 / 1000.0  # diameter in mm,  mm^3 -> mL
 
 
-def oblong_volume_ml(polygon, pixels_per_mm):
-    """Estimate the volume of an oblong object using the disk method from calculus.
+def find_oblong_length_and_volume(polygon, pixels_per_mm):
+    """Estimate the volume and long-axis length of an oblong object using the disk method from calculus.
 
     Steps:
     1. Rasterize the mask polygon into a local binary image.
@@ -92,9 +108,12 @@ def oblong_volume_ml(polygon, pixels_per_mm):
     4. For each column of the rotated mask, the non-zero pixel count is the diameter
        of the object at that slice of the axis.
     5. Volume = sum(pi * r^2 * dx) across all columns, in mm.
+    6. Long-axis length = number of columns containing at least one mask pixel.
+
+    Returns (length_mm, volume_ml).
     """
     if len(polygon) < 5:
-        return 0.0
+        return 0.0, 0.0
 
     pts = polygon.astype(np.float32)
 
@@ -109,7 +128,7 @@ def oblong_volume_ml(polygon, pixels_per_mm):
     w = int(math.ceil(pts_local[:, 0].max())) + 1 # Right-most edge of polygon
     h = int(math.ceil(pts_local[:, 1].max())) + 1 # Bottom-most edge of polygon
     if w < 5 or h < 5: # If polygon is too small, skip it
-        return 0.0
+        return 0.0, 0.0
 
     # Create an new image that only contains the polygon, all points inside the polygon are filled with 255 pixel value
     mask = np.zeros((h, w), dtype=np.uint8)
@@ -137,7 +156,14 @@ def oblong_volume_ml(polygon, pixels_per_mm):
     if rotated.shape[0] > rotated.shape[1]:
         rotated = cv2.rotate(rotated, cv2.ROTATE_90_CLOCKWISE)
 
-    # --- 4. disk method: walk across each column, treat it as one disk, and calculate its volume
+    # Long-axis length: Count of columns that contain at least one mask pixel.
+    # For each column, check whether ANY pixel in that column is non-zero.
+    # Then, count how many columns are True (i.e. contain at least one mask pixel).
+    column_has_mask = np.any(rotated, axis=0)
+    length_px = int(np.count_nonzero(column_has_mask))
+    length_mm = length_px / pixels_per_mm
+
+    # --- 4. Disk method: walk across each column, treat it as one disk, and calculate its volume
     dx_mm = 1.0 / pixels_per_mm   # Each column is 1 pixel wide, so dx is just 1px converted to mm
     disk_volumes = [] # Array to store volume of each disk
     num_columns = rotated.shape[1]
@@ -159,53 +185,21 @@ def oblong_volume_ml(polygon, pixels_per_mm):
     # --- 5. Calculate total volume by summing all disks
     total_vol_mm3 = sum(disk_volumes)
 
-    return total_vol_mm3 / 1000.0  # mm^3 -> mL
+    return length_mm, total_vol_mm3 / 1000.0  # long-axis length in mm,  mm^3 -> mL
 
 
-def estimate_volume_ml(classname, polygon, pixels_per_mm):
-    """Dispatch to the right volume estimator based on the class's shape category."""
-    if classname in SPHERICAL_CLASSES:
-        return spherical_volume_ml(polygon, pixels_per_mm)
-    if classname in OBLONG_CLASSES:
-        return oblong_volume_ml(polygon, pixels_per_mm)
-    return 0.0  # Unknown / unsupported shape category
-
-
-# =========================================================================================
-# Length estimation (used for the per-object label drawn on the camera feed)
-# =========================================================================================
-
-def spherical_length_mm(polygon, pixels_per_mm):
-    """Diameter of the area-equivalent circle for a spherical object, in mm."""
-    if len(polygon) < 3:
-        return 0.0
-    area_px = cv2.contourArea(polygon.astype(np.float32))
-    if area_px <= 0:
-        return 0.0
-    area_mm2 = area_px / (pixels_per_mm ** 2)
-    d_mm = 2.0 * math.sqrt(area_mm2 / math.pi)  # A = pi*r^2  --->  d = 2*sqrt(A/pi)
-    return d_mm
-
-
-def oblong_length_mm(polygon, pixels_per_mm):
-    """Length of the long axis of an oblong object, in mm.
-    Uses the minimum-area rotated bounding rectangle — the longer of its two sides
-    is a good estimate of the object's long-axis length.
+def find_length_and_volume(classname, polygon, pixels_per_mm):
+    """Dispatch to the right estimator based on the class's shape category.
+    Returns (length_mm, volume_ml).
     """
-    if len(polygon) < 5:
-        return 0.0
-    (_, _), (w_px, h_px), _ = cv2.minAreaRect(polygon.astype(np.float32))
-    length_px = max(w_px, h_px)
-    return length_px / pixels_per_mm
-
-
-def estimate_length_mm(classname, polygon, pixels_per_mm):
-    """Dispatch to the right length estimator based on the class's shape category."""
     if classname in SPHERICAL_CLASSES:
-        return spherical_length_mm(polygon, pixels_per_mm)
+        length_mm, vol_ml = find_spherical_length_and_volume(polygon, pixels_per_mm)
+        # Apply the per-class Finagling Factor to correct for the fact that real vegetables aren't perfect spheres.
+        vol_ml *= FINAGLING_FACTORS.get(classname, 1.0)
+        return length_mm, vol_ml
     if classname in OBLONG_CLASSES:
-        return oblong_length_mm(polygon, pixels_per_mm)
-    return 0.0  # Unknown / unsupported shape category
+        return find_oblong_length_and_volume(polygon, pixels_per_mm)
+    return 0.0, 0.0  # Unknown / unsupported shape category
 
 
 # =========================================================================================
@@ -290,8 +284,11 @@ def main():
     labels = model.names
 
     # Open the USB camera
-    cap = cv2.VideoCapture(cv2.CAP_DSHOW + CAMERA_INDEX)
-    #cap = cv2.VideoCapture('VeggieVision-Test.avi')
+    if TEST_VIDEO_NAME is not None:
+        cap = cv2.VideoCapture(TEST_VIDEO_NAME)
+    else:
+        cap = cv2.VideoCapture(cv2.CAP_DSHOW + CAMERA_INDEX)
+    
     if not cap.isOpened():
         print(f'ERROR: Could not open USB camera at index {CAMERA_INDEX}.')
         sys.exit(1)
@@ -344,8 +341,8 @@ def main():
 
                 color = MASK_COLORS[classidx % 10]
 
-                # Volume & weight
-                vol_ml = estimate_volume_ml(classname, polygon, PIXELS_PER_MM)
+                # Volume, length & weight
+                length_mm, vol_ml = find_length_and_volume(classname, polygon, PIXELS_PER_MM)
                 density = DENSITIES.get(classname, 1.0)
                 weight_g = vol_ml * density
 
@@ -358,7 +355,6 @@ def main():
 
                 # Draw mask + label (label shows per-item length: diameter for spherical,
                 # long-axis length for oblong).
-                length_mm = estimate_length_mm(classname, polygon, PIXELS_PER_MM)
                 label = f'{classname}: {length_mm:.0f} mm'
                 draw_mask(frame, overlay, polygon, color, label)
 
